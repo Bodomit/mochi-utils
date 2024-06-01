@@ -201,7 +201,6 @@ mod test {
         let s1 = KanaString::from("サッカー".to_string())
             .iter_mora()
             .collect::<Vec<_>>();
-        print!("{:#?}", s1);
         assert_eq!(s1.len(), 3);
         assert_eq!(s1[0], "サッ");
         assert_eq!(s1[1], "カ");
@@ -210,7 +209,6 @@ mod test {
         let s2 = KanaString::from("れっしゃ".to_string())
             .iter_mora()
             .collect::<Vec<_>>();
-        print!("{:#?}", s2);
         assert_eq!(s2.len(), 2);
         assert_eq!(s2[0], "れっ");
         assert_eq!(s2[1], "しゃ");
