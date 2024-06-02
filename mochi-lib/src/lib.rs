@@ -154,7 +154,7 @@ pub async fn update_cards(config: &Config, cards: &Box<[Card]>) -> Result<(), Bo
 }
 
 // Japanese String
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct KanaString(String);
 
 impl KanaString {
@@ -191,39 +191,22 @@ impl From<String> for KanaString {
     }
 }
 
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_iter_mora() {
-        // <-- actual test
-        let s1 = KanaString::from("サッカー".to_string())
-            .iter_mora()
-            .collect::<Vec<_>>();
-        assert_eq!(s1.len(), 3);
-        assert_eq!(s1[0], "サッ");
-        assert_eq!(s1[1], "カ");
-        assert_eq!(s1[2], "ー");
-
-        let s2 = KanaString::from("れっしゃ".to_string())
-            .iter_mora()
-            .collect::<Vec<_>>();
-        assert_eq!(s2.len(), 2);
-        assert_eq!(s2[0], "れっ");
-        assert_eq!(s2[1], "しゃ");
-    }
-}
-
 // Accents
 pub type Word = String;
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Hash)]
 pub enum AccentType {
     Heiban,
     Atamadaka,
     Nakadaka(usize),
     Odaka,
+}
+
+#[derive(Debug, Copy, Clone, PartialEq)]
+pub enum MoraEdges {
+    Top,
+    Bottom,
+    Left,
 }
 
 #[derive(Debug, Clone)]
@@ -233,20 +216,10 @@ pub struct Accent {
 }
 
 #[derive(Debug, Clone)]
-pub struct AccentDefinition {
+pub struct WordAccents {
     kana: KanaString,
     accents: Vec<Accent>,
 }
-
-impl AccentDefinition {
-    pub fn get_html(&self, accent_map: &AccentMap) -> String {
-        let mora = self.kana.iter_mora().collect::<Vec<_>>();
-        mora[0].clone()
-    }
-}
-
-pub type AccentMap = HashMap<Word, Vec<AccentDefinition>>;
-
 pub fn load_accents() -> AccentMap {
     let raw = std::str::from_utf8(include_bytes!("../resources/accents.txt")).unwrap();
     let lines = raw.lines().collect::<Vec<_>>();
@@ -255,10 +228,12 @@ pub fn load_accents() -> AccentMap {
     let regex_note_ex = Regex::new(r"\((\w)\)").unwrap();
     let regex_index_ex = Regex::new(r"(\d+)").unwrap();
 
-    for (i, line) in lines.iter().enumerate() {
+    for line in lines.iter() {
         let mut splits = line.split('\t');
         let word = splits.next().unwrap().to_string();
         let kana = splits.next().unwrap().to_string();
+        let kana = KanaString::from(if kana.is_empty() { word.clone() } else { kana });
+        let n_mora = kana.iter_mora().collect::<Vec<_>>().len();
 
         let accents = splits
             .next()
@@ -280,7 +255,7 @@ pub fn load_accents() -> AccentMap {
                     AccentType::Heiban
                 } else if index == 1 {
                     AccentType::Atamadaka
-                } else if index == s.len() - 1 {
+                } else if index == n_mora {
                     AccentType::Odaka
                 } else {
                     AccentType::Nakadaka(index)
@@ -290,24 +265,286 @@ pub fn load_accents() -> AccentMap {
             })
             .collect::<Vec<_>>();
 
-        let accent_definition = AccentDefinition {
-            kana: KanaString::from(if kana.is_empty() { word.clone() } else { kana }),
-            accents,
-        };
+        let accent_definition = WordAccents { kana, accents };
 
         let word_entry = words.entry(word).or_insert(vec![]);
         word_entry.push(accent_definition);
-
-        if i % 10000 == 0 {
-            let percentage = (i + 1) * 100 / lines.len();
-            println!(
-                "Loading Accents Progress: {}/{} ({:.0}%)",
-                i + 1,
-                lines.len(),
-                percentage
-            );
-        }
     }
 
     words
+}
+
+impl WordAccents {
+    pub fn generate_html(&self, accent_map: &AccentMap) -> String {
+        "".to_string()
+    }
+}
+
+fn generate_html_for_accent(kana_string: &KanaString, accent: &Accent) -> String {
+    let mora_edges = generate_mora_edges(kana_string, &accent.accent_type);
+    let kana_with_final_whitespace = KanaString::from(
+        kana_string
+            .0
+            .chars()
+            .chain(vec!['…'].into_iter())
+            .collect::<String>(),
+    );
+
+    let mora_html = kana_with_final_whitespace
+        .iter_mora()
+        .zip(mora_edges)
+        .map(|(mora, edges)| {
+            let colour = "#FF6633";
+            let width = "medium";
+            let border_style = format!(": {} {} solid;", colour, width);
+            let border_css = edges
+                .iter()
+                .map(|e| match e {
+                    MoraEdges::Top => format!("BORDER-TOP{}", border_style),
+                    MoraEdges::Bottom => format!("BORDER-BOTTOM{}", border_style),
+                    MoraEdges::Left => format!("BORDER-LEFT{}", border_style),
+                })
+                .collect::<String>();
+
+            format!("<span style=\"{}\">{}</span>", border_css, mora)
+        })
+        .collect::<String>();
+
+    // If the accent has a note, prepend it to the html.
+    if accent.note.is_some() {
+        format!(
+            "<span style=\"font-weight:bold\">{}</span>{}",
+            accent.note.clone().unwrap(),
+            mora_html
+        )
+    } else {
+        mora_html
+    }
+}
+
+fn generate_mora_edges(kana_string: &KanaString, accent_type: &AccentType) -> Vec<Vec<MoraEdges>> {
+    // Get the edges for the more itself.
+    let n_mora = kana_string.iter_mora().collect::<Vec<_>>().len();
+    let mut mora_edges = kana_string
+        .iter_mora()
+        .enumerate()
+        .map(|(i, s)| match accent_type {
+            AccentType::Heiban => match i {
+                0 => vec![MoraEdges::Bottom],
+                1 => vec![MoraEdges::Left, MoraEdges::Top],
+                2.. => vec![MoraEdges::Top],
+            },
+            AccentType::Atamadaka => match i {
+                0 => vec![MoraEdges::Top],
+                1 => vec![MoraEdges::Left, MoraEdges::Bottom],
+                2.. => vec![MoraEdges::Bottom],
+            },
+            AccentType::Nakadaka(idx) => match i {
+                0 => vec![MoraEdges::Bottom],
+                1 => vec![MoraEdges::Left, MoraEdges::Top],
+                _ if i < *idx => vec![MoraEdges::Top],
+                _ if i == *idx => vec![MoraEdges::Left, MoraEdges::Bottom],
+                _ => vec![MoraEdges::Bottom],
+            },
+            AccentType::Odaka => match i {
+                0 => {
+                    if n_mora == 1 {
+                        vec![MoraEdges::Top]
+                    } else {
+                        vec![MoraEdges::Bottom]
+                    }
+                }
+                1 => vec![MoraEdges::Left, MoraEdges::Top],
+                _ => vec![MoraEdges::Top],
+            },
+        })
+        .collect::<Vec<Vec<MoraEdges>>>();
+
+    // Insert the edges for the particle following the word.
+    mora_edges.push(match accent_type {
+        AccentType::Heiban => vec![MoraEdges::Top],
+        AccentType::Atamadaka => vec![MoraEdges::Bottom],
+        AccentType::Nakadaka(_) => vec![MoraEdges::Bottom],
+        AccentType::Odaka => vec![MoraEdges::Left, MoraEdges::Bottom],
+    });
+
+    mora_edges
+}
+
+pub type AccentMap = HashMap<Word, Vec<WordAccents>>;
+
+// TODO Test notes are getting correctly loaded by load accents.
+// Use かちかち as a test case.
+
+#[cfg(test)]
+mod test {
+    use crate::AccentType::{Atamadaka, Heiban, Nakadaka, Odaka};
+
+    use super::*;
+
+    #[test]
+    fn test_accent_type() {
+        let accents = load_accents();
+
+        let trials = vec![
+            ("サッカー", "サッカー", vec![Atamadaka]),
+            ("箸", "はし", vec![Atamadaka]),
+            ("橋", "はし", vec![Odaka]),
+            ("端", "はし", vec![Heiban]),
+            ("鼻", "はな", vec![Heiban]),
+            ("花", "はな", vec![Odaka]),
+            ("あの方", "あのかた", vec![Nakadaka(3), Odaka]),
+        ];
+        let trials = trials
+            .iter()
+            .map(|(w, k, v)| (w.to_string(), KanaString::from(k.to_string()), v))
+            .collect::<Vec<_>>();
+
+        for (word, kana, true_accents) in trials.iter() {
+            let test_accents = &accents[word]
+                .iter()
+                .filter(|w| w.kana == *kana)
+                .flat_map(|w| w.accents.clone())
+                .map(|a| a.accent_type)
+                .collect::<Vec<_>>();
+            let true_accents: HashSet<&AccentType> = true_accents.iter().collect();
+
+            assert_eq!(test_accents.len(), true_accents.len());
+            for test_accent in test_accents {
+                assert!(
+                    true_accents.contains(test_accent),
+                    "{:#?} in {:#?}",
+                    test_accent,
+                    true_accents
+                )
+            }
+        }
+    }
+
+    #[test]
+    fn test_iter_mora() {
+        // <-- actual test
+        let s1 = KanaString::from("サッカー".to_string())
+            .iter_mora()
+            .collect::<Vec<_>>();
+        assert_eq!(s1.len(), 3);
+        assert_eq!(s1[0], "サッ");
+        assert_eq!(s1[1], "カ");
+        assert_eq!(s1[2], "ー");
+
+        let s2 = KanaString::from("れっしゃ".to_string())
+            .iter_mora()
+            .collect::<Vec<_>>();
+        assert_eq!(s2.len(), 2);
+        assert_eq!(s2[0], "れっ");
+        assert_eq!(s2[1], "しゃ");
+    }
+
+    #[test]
+    fn test_generate_mora_edges() {
+        let t = generate_mora_edges(&KanaString::from("き".to_string()), &AccentType::Odaka);
+        assert_eq!(t.len(), 2);
+        assert_eq!(t[0].len(), 1);
+        assert_eq!(t[0][0], MoraEdges::Top);
+        assert_eq!(t[1].len(), 2);
+        assert_eq!(t[1][0], MoraEdges::Left);
+        assert_eq!(t[1][1], MoraEdges::Bottom);
+
+        let t = generate_mora_edges(&KanaString::from("かわ".to_string()), &AccentType::Odaka);
+        assert_eq!(t.len(), 3);
+        assert_eq!(t[0].len(), 1);
+        assert_eq!(t[0][0], MoraEdges::Bottom);
+        assert_eq!(t[1].len(), 2);
+        assert_eq!(t[1][0], MoraEdges::Left);
+        assert_eq!(t[1][1], MoraEdges::Top);
+        assert_eq!(t[2].len(), 2);
+        assert_eq!(t[2][0], MoraEdges::Left);
+        assert_eq!(t[2][1], MoraEdges::Bottom);
+
+        let t = generate_mora_edges(&KanaString::from("じかん".to_string()), &AccentType::Heiban);
+        assert_eq!(t.len(), 4);
+        assert_eq!(t[0].len(), 1);
+        assert_eq!(t[0][0], MoraEdges::Bottom);
+        assert_eq!(t[1].len(), 2);
+        assert_eq!(t[1][0], MoraEdges::Left);
+        assert_eq!(t[1][1], MoraEdges::Top);
+        assert_eq!(t[2].len(), 1);
+        assert_eq!(t[2][0], MoraEdges::Top);
+        assert_eq!(t[3].len(), 1);
+        assert_eq!(t[3][0], MoraEdges::Top);
+
+        let t = generate_mora_edges(
+            &KanaString::from("てんき".to_string()),
+            &AccentType::Atamadaka,
+        );
+        assert_eq!(t.len(), 4);
+        assert_eq!(t[0].len(), 1);
+        assert_eq!(t[0][0], MoraEdges::Top);
+        assert_eq!(t[1].len(), 2);
+        assert_eq!(t[1][0], MoraEdges::Left);
+        assert_eq!(t[1][1], MoraEdges::Bottom);
+        assert_eq!(t[2].len(), 1);
+        assert_eq!(t[2][0], MoraEdges::Bottom);
+        assert_eq!(t[3].len(), 1);
+        assert_eq!(t[3][0], MoraEdges::Bottom);
+
+        let t = generate_mora_edges(
+            &KanaString::from("ひとつ".to_string()),
+            &AccentType::Nakadaka(2),
+        );
+        assert_eq!(t.len(), 4);
+        assert_eq!(t[0].len(), 1);
+        assert_eq!(t[0][0], MoraEdges::Bottom);
+        assert_eq!(t[1].len(), 2);
+        assert_eq!(t[1][0], MoraEdges::Left);
+        assert_eq!(t[1][1], MoraEdges::Top);
+        assert_eq!(t[2].len(), 2);
+        assert_eq!(t[2][0], MoraEdges::Left);
+        assert_eq!(t[2][1], MoraEdges::Bottom);
+        assert_eq!(t[3].len(), 1);
+        assert_eq!(t[3][0], MoraEdges::Bottom);
+
+        let t = generate_mora_edges(
+            &KanaString::from("こうじょう".to_string()),
+            &AccentType::Nakadaka(3),
+        );
+        assert_eq!(t.len(), 5);
+        assert_eq!(t[0].len(), 1);
+        assert_eq!(t[0][0], MoraEdges::Bottom);
+        assert_eq!(t[1].len(), 2);
+        assert_eq!(t[1][0], MoraEdges::Left);
+        assert_eq!(t[1][1], MoraEdges::Top);
+        assert_eq!(t[2].len(), 1);
+        assert_eq!(t[2][0], MoraEdges::Top);
+        assert_eq!(t[3].len(), 2);
+        assert_eq!(t[3][0], MoraEdges::Left);
+        assert_eq!(t[3][1], MoraEdges::Bottom);
+        assert_eq!(t[4].len(), 1);
+        assert_eq!(t[3][1], MoraEdges::Bottom);
+    }
+
+    #[test]
+    fn test_generate_html_for_accent() {
+        let accents = load_accents();
+        let t1 = &accents[&"あの方".to_string()][0];
+        let r1 = generate_html_for_accent(
+            &t1.kana,
+            &t1.accents
+                .iter()
+                .find(|a| a.accent_type == AccentType::Nakadaka(3))
+                .unwrap(),
+        );
+        assert_eq!(r1, "<span style=\"BORDER-BOTTOM: #FF6633 medium solid;\">あ</span><span style=\"BORDER-LEFT: #FF6633 medium solid;BORDER-TOP: #FF6633 medium solid;\">の</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">か</span><span style=\"BORDER-LEFT: #FF6633 medium solid;BORDER-BOTTOM: #FF6633 medium solid;\">た</span><span style=\"BORDER-BOTTOM: #FF6633 medium solid;\">…</span>");
+
+        let t2 = &accents[&"かちかち".to_string()][0];
+        let r2 = generate_html_for_accent(
+            &t2.kana,
+            &t2.accents
+                .iter()
+                .find(|a| a.accent_type == AccentType::Heiban)
+                .unwrap(),
+        );
+
+        assert_eq!(r2, "<span style=\"BORDER-BOTTOM: #FF6633 medium solid;\">か</span><span style=\"BORDER-LEFT: #FF6633 medium solid;BORDER-TOP: #FF6633 medium solid;\">ち</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">か</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">ち</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">…</span>");
+    }
 }
