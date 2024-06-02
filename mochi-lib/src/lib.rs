@@ -2,18 +2,28 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error;
 use std::ops::Deref;
 use std::sync::Arc;
+use std::{cmp, env};
 
 use regex::Regex;
+use reqwest::Response;
 use serde::Deserialize;
+use serde_json::Value;
 use tokio::task::JoinSet;
 
-use crate::models::{Card, Deck, PaginatedResponse, Template};
+use crate::models::{Card, CardField, Deck, PaginatedResponse, Template};
 
 mod models;
 
 #[derive(Debug, Clone)]
 pub struct Config {
     pub mochi_key: String,
+}
+
+impl Config {
+    pub fn build() -> Result<Config, Box<dyn std::error::Error>> {
+        let mochi_key = env::var("MOCHI_KEY")?;
+        Ok(Config { mochi_key })
+    }
 }
 
 const MOCHI_BASE: &str = "https://app.mochi.cards/api/";
@@ -33,8 +43,8 @@ where
     let client = reqwest::Client::new();
     let mut bookmark: Option<String> = None;
     let mut page_count = 1u32;
+    let mut errors = vec![];
     loop {
-        println!("Page {}", page_count);
         page_count = page_count + 1;
 
         let url = format!("{}{}", MOCHI_BASE, endpoint);
@@ -57,6 +67,16 @@ where
             .send()
             .await?;
 
+        match resp.error_for_status_ref() {
+            Ok(_) => {}
+            Err(err) => {
+                let text = resp.text().await.unwrap();
+                let json: Value = serde_json::from_str(text.as_str())?;
+                errors.push(format!("Error {:#?} with body {:#?}", err, json));
+                continue;
+            }
+        }
+
         let page = resp.json::<PaginatedResponse<T>>().await?;
 
         if page.docs.len() == 0 {
@@ -75,7 +95,11 @@ where
         }
     }
 
-    Ok(mochi_objects.into_boxed_slice())
+    if errors.is_empty() {
+        Ok(mochi_objects.into_boxed_slice())
+    } else {
+        Err(errors.join("\n").into())
+    }
 }
 
 pub async fn list_decks(config: &Config) -> Result<Box<[Deck]>, Box<dyn Error>> {
@@ -92,15 +116,19 @@ pub async fn list_templates(config: &Config) -> Result<Box<[Template]>, Box<dyn 
 
 pub async fn list_cards(
     config: &Config,
-    deck_id: String,
+    deck_id: &String,
     limit: Option<usize>,
 ) -> Result<Box<[Card]>, Box<dyn Error>> {
+    let per_call_limit = cmp::min(limit.unwrap_or(100), 100); // Max allowed is 100.
     let additional_args = HashMap::from([
         (
             "deck-id".to_string(),
             serde_json::to_value(deck_id).unwrap(),
         ),
-        ("limit".to_string(), serde_json::to_value(100).unwrap()),
+        (
+            "limit".to_string(),
+            serde_json::to_value(per_call_limit).unwrap(),
+        ),
     ]);
     let cards = list("cards".to_string(), &additional_args, config, limit).await?;
     Ok(cards)
@@ -111,17 +139,18 @@ pub async fn update_card(
     config: Arc<Config>,
     cards: Arc<[Card]>,
     index: usize,
-) -> Result<(), reqwest::Error> {
+) -> Result<Response, reqwest::Error> {
     let client = reqwest::Client::new();
     let card = cards[index].clone();
     let url = format!("{}{}{}", MOCHI_BASE, "cards/", card.id);
-    client
+    let resp = client
         .post(url)
         .basic_auth(&config.mochi_key, Some(""))
         .json(&card)
         .send()
-        .await?;
-    Ok(())
+        .await;
+
+    resp
 }
 
 pub async fn update_cards(config: &Config, cards: &Box<[Card]>) -> Result<(), Box<dyn Error>> {
@@ -136,21 +165,101 @@ pub async fn update_cards(config: &Config, cards: &Box<[Card]>) -> Result<(), Bo
     let mut completed = 0u32;
 
     // Join and process the results.
+    let mut errors = vec![];
     while let Some(res) = tasks.join_next().await {
-        let result = res.unwrap();
-        match result {
+        let result = res.unwrap().unwrap();
+
+        match result.error_for_status_ref() {
             Ok(_) => {
                 completed = completed + 1;
                 let percent = (completed as f32 / cards.len() as f32) * 100f32;
                 println!("Progress: {}/{} {}%", completed, cards.len(), percent);
             }
             Err(err) => {
-                print!("Error: {:#?}", err);
+                let body = result.text().await?;
+                let json: Value = serde_json::from_str(body.as_str())?;
+                println!("Error: {:#?} with {:#?}", err, json);
+                errors.push(err);
             }
         };
     }
 
-    Ok(())
+    if errors.len() > 0 {
+        Err(errors
+            .into_iter()
+            .map(|e| format!("{:#?}", e))
+            .collect::<Vec<_>>()
+            .join("\n")
+            .into())
+    } else {
+        Ok(())
+    }
+}
+
+pub async fn add_pitch_accent_to_cards(
+    config: &Config,
+    cards: &Box<[Card]>,
+    word_field_name: &String,
+    pitch_accent_field_name: &String,
+) -> Result<Box<[Card]>, Box<dyn Error>> {
+    let accents = load_accents();
+    let templates = list_templates(config).await?;
+    let cards = cards
+        .iter()
+        .map(|card| {
+            // Get the template.
+            let template_id = card.template_id.as_ref().unwrap();
+            let template_fields = templates
+                .iter()
+                .find(|t| t.id.eq(template_id))
+                .and_then(|f| f.fields.clone());
+            if template_fields.is_none() {
+                return card.clone();
+            }
+            let template_fields = template_fields.as_ref().unwrap();
+
+            // Get the word field.
+            let word_field = template_fields
+                .iter()
+                .find(|(_, v)| v.name.eq(word_field_name));
+            if word_field.is_none() {
+                return card.clone();
+            }
+            let word_field = word_field.unwrap().1;
+
+            // Get the pitch accent field.
+            let pitch_accent_field = &template_fields
+                .iter()
+                .find(|(_, v)| v.name.eq(pitch_accent_field_name));
+            if pitch_accent_field.is_none() {
+                return card.clone();
+            }
+            let pitch_accent_field = pitch_accent_field.unwrap().1;
+
+            let mut fields = card.fields.clone();
+            if fields.is_none() {
+                return card.clone();
+            }
+            let fields: &mut HashMap<std::string::String, CardField> = fields.as_mut().unwrap();
+            let word = &fields.get(&word_field.id);
+            if word.is_none() {
+                return card.clone();
+            }
+            let word = &word.unwrap().value;
+            let html = generate_html(word, &accents);
+            let pitch_accent = CardField {
+                id: pitch_accent_field.id.clone(),
+                value: html,
+            };
+            fields.insert(pitch_accent_field.id.clone(), pitch_accent);
+
+            let mut card = card.clone();
+            card.fields = Some(fields.clone());
+            card
+        })
+        .collect::<Vec<_>>();
+
+    Ok(cards.into_boxed_slice())
 }
 
 // Japanese String
@@ -274,10 +383,22 @@ pub fn load_accents() -> AccentMap {
     words
 }
 
-impl WordAccents {
-    pub fn generate_html(&self, accent_map: &AccentMap) -> String {
-        "".to_string()
-    }
+pub fn generate_html(word: &Word, accent_map: &AccentMap) -> String {
+    let inner = accent_map
+        .get(word)
+        .unwrap_or(&vec![])
+        .iter()
+        .map(|wa| {
+            wa.accents
+                .iter()
+                .map(|a| generate_html_for_accent(&wa.kana, a))
+                .collect::<Vec<_>>()
+                .join(&vec!['\u{30FB}'].iter().collect::<String>())
+        })
+        .collect::<Vec<_>>()
+        .join("<div style=\"line-height:100%;\"><br></div>");
+
+    format!("<div style=\"text-align: center\">{}</div>", inner)
 }
 
 fn generate_html_for_accent(kana_string: &KanaString, accent: &Accent) -> String {
@@ -328,7 +449,7 @@ fn generate_mora_edges(kana_string: &KanaString, accent_type: &AccentType) -> Ve
     let mut mora_edges = kana_string
         .iter_mora()
         .enumerate()
-        .map(|(i, s)| match accent_type {
+        .map(|(i, _)| match accent_type {
             AccentType::Heiban => match i {
                 0 => vec![MoraEdges::Bottom],
                 1 => vec![MoraEdges::Left, MoraEdges::Top],
@@ -379,6 +500,64 @@ pub type AccentMap = HashMap<Word, Vec<WordAccents>>;
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn read_mochi_key() {
+        // <-- actual test
+        let config = Config::build().unwrap();
+        assert!(!config.mochi_key.is_empty())
+    }
+
+    #[tokio::test]
+    async fn test_list_decks() {
+        let config = Config::build().unwrap();
+        let decks = list_decks(&config).await.unwrap();
+        assert!(!decks.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_cards() {
+        let config = Config::build().unwrap();
+        let decks = list_decks(&config).await.unwrap();
+        let n3_deck = decks.iter().find(|d| d.name == "N3");
+
+        let cards = list_cards(&config, &n3_deck.unwrap().id, Some(10))
+            .await
+            .unwrap();
+        assert!(!cards.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_list_template() {
+        let config = Config::build().unwrap();
+        let templates = list_templates(&config).await.unwrap();
+        assert!(!templates.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_add_pitch_accent_to_cards() {
+        let config = Config::build().unwrap();
+        let decks = list_decks(&config).await.unwrap();
+        let n3_deck = decks.iter().find(|d| d.id == "MK5LCEAL");
+
+        let cards = list_cards(&config, &n3_deck.unwrap().id, Some(10))
+            .await
+            .unwrap();
+        let cards = add_pitch_accent_to_cards(
+            &config,
+            &cards,
+            &"Word".to_string(),
+            &"PitchAccent".to_string(),
+        )
+        .await
+        .unwrap();
+
+        let result = update_cards(&config, &cards).await;
+        match result {
+            Ok(_) => {}
+            Err(err) => println!("{:#?}", err),
+        }
+    }
 
     #[test]
     fn test_accent_notes() {
@@ -565,8 +744,16 @@ mod test {
                 .unwrap(),
         );
 
-        print!("{}", r2);
-
         assert_eq!(r2, "<span style=\"font-weight:bold\">形動: </span><span style=\"BORDER-BOTTOM: #FF6633 medium solid;\">か</span><span style=\"BORDER-LEFT: #FF6633 medium solid;BORDER-TOP: #FF6633 medium solid;\">ち</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">か</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">ち</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">…</span>");
+    }
+
+    #[test]
+    fn test_generate_html() {
+        let accents = load_accents();
+        let t1 = generate_html(&"あの方".to_string(), &accents);
+        assert_eq!(t1, "<div style=\"text-align: center\"><span style=\"BORDER-BOTTOM: #FF6633 medium solid;\">あ</span><span style=\"BORDER-LEFT: #FF6633 medium solid;BORDER-TOP: #FF6633 medium solid;\">の</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">か</span><span style=\"BORDER-LEFT: #FF6633 medium solid;BORDER-BOTTOM: #FF6633 medium solid;\">た</span><span style=\"BORDER-BOTTOM: #FF6633 medium solid;\">…</span>・<span style=\"BORDER-BOTTOM: #FF6633 medium solid;\">あ</span><span style=\"BORDER-LEFT: #FF6633 medium solid;BORDER-TOP: #FF6633 medium solid;\">の</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">か</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">た</span><span style=\"BORDER-LEFT: #FF6633 medium solid;BORDER-BOTTOM: #FF6633 medium solid;\">…</span></div>");
+
+        let t2 = generate_html(&"この後".to_string(), &accents);
+        assert_eq!(t2, "<div style=\"text-align: center\"><span style=\"BORDER-BOTTOM: #FF6633 medium solid;\">こ</span><span style=\"BORDER-LEFT: #FF6633 medium solid;BORDER-TOP: #FF6633 medium solid;\">の</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">あ</span><span style=\"BORDER-LEFT: #FF6633 medium solid;BORDER-BOTTOM: #FF6633 medium solid;\">と</span><span style=\"BORDER-BOTTOM: #FF6633 medium solid;\">…</span><div style=\"line-height:100%;\"><br></div><span style=\"BORDER-BOTTOM: #FF6633 medium solid;\">こ</span><span style=\"BORDER-LEFT: #FF6633 medium solid;BORDER-TOP: #FF6633 medium solid;\">の</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">の</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">ち</span><span style=\"BORDER-LEFT: #FF6633 medium solid;BORDER-BOTTOM: #FF6633 medium solid;\">…</span>・<span style=\"BORDER-BOTTOM: #FF6633 medium solid;\">こ</span><span style=\"BORDER-LEFT: #FF6633 medium solid;BORDER-TOP: #FF6633 medium solid;\">の</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">の</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">ち</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">…</span></div>");
     }
 }

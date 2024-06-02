@@ -38,23 +38,28 @@ pub struct CardField {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Card {
-    pub id: String,
     pub content: String,
     #[serde(rename = "deck-id")]
     pub deck_id: String,
-    pub tags: Vec<String>,
-    pub references: Vec<String>,
     #[serde(rename = "template-id")]
     pub template_id: Option<String>,
     pub fields: Option<HashMap<String, CardField>>,
-    #[serde(rename = "archived?")]
-    pub archived: Option<bool>,
-    #[serde(rename = "trashed?")]
-    pub trashed: Option<Value>,
-    #[serde(rename = "review-reverse?")]
-    pub review_reverse: Option<bool>,
+    #[serde(rename = "archived?", default)]
+    pub archived: bool,
+    #[serde(rename = "review-reverse?", default)]
+    pub review_reverse: bool,
     pub pos: Option<String>,
+    // Retrieval Only Values
+    #[serde(skip_serializing)]
+    pub id: String,
+    #[serde(skip_serializing)]
+    pub tags: Vec<String>,
+    #[serde(skip_serializing)]
+    pub references: Vec<String>,
+    #[serde(skip_serializing)]
     pub attachments: Option<Value>,
+    #[serde(rename = "trashed?", skip_serializing)]
+    pub trashed: Option<Value>,
 }
 
 // API
