@@ -225,7 +225,7 @@ pub fn load_accents() -> AccentMap {
     let lines = raw.lines().collect::<Vec<_>>();
 
     let mut words = AccentMap::with_capacity(lines.len());
-    let regex_note_ex = Regex::new(r"\((\w)\)").unwrap();
+    let regex_note_ex = Regex::new(r"\(([\D]+)\)").unwrap();
     let regex_index_ex = Regex::new(r"(\d+)").unwrap();
 
     for line in lines.iter() {
@@ -242,12 +242,12 @@ pub fn load_accents() -> AccentMap {
             .map(|s| {
                 let note = regex_note_ex
                     .captures(s)
-                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get(1))
                     .and_then(|c| Some(c.as_str().to_string()));
 
                 let index = regex_index_ex
                     .captures(s)
-                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get(1))
                     .and_then(|c| Some(c.as_str().parse::<usize>().unwrap()))
                     .unwrap();
 
@@ -313,7 +313,7 @@ fn generate_html_for_accent(kana_string: &KanaString, accent: &Accent) -> String
     // If the accent has a note, prepend it to the html.
     if accent.note.is_some() {
         format!(
-            "<span style=\"font-weight:bold\">{}</span>{}",
+            "<span style=\"font-weight:bold\">{}: </span>{}",
             accent.note.clone().unwrap(),
             mora_html
         )
@@ -378,22 +378,42 @@ pub type AccentMap = HashMap<Word, Vec<WordAccents>>;
 
 #[cfg(test)]
 mod test {
-    use crate::AccentType::{Atamadaka, Heiban, Nakadaka, Odaka};
-
     use super::*;
+
+    #[test]
+    fn test_accent_notes() {
+        let accents = load_accents();
+
+        let t1 = &accents[&"かちかち".to_string()][0].accents;
+        for accent in t1 {
+            match accent.accent_type {
+                AccentType::Heiban => {
+                    assert_eq!("形動".to_string(), accent.note.clone().unwrap_or_default())
+                }
+                AccentType::Atamadaka => {
+                    assert_eq!("副;名".to_string(), accent.note.clone().unwrap_or_default())
+                }
+                _ => {}
+            }
+        }
+    }
 
     #[test]
     fn test_accent_type() {
         let accents = load_accents();
 
         let trials = vec![
-            ("サッカー", "サッカー", vec![Atamadaka]),
-            ("箸", "はし", vec![Atamadaka]),
-            ("橋", "はし", vec![Odaka]),
-            ("端", "はし", vec![Heiban]),
-            ("鼻", "はな", vec![Heiban]),
-            ("花", "はな", vec![Odaka]),
-            ("あの方", "あのかた", vec![Nakadaka(3), Odaka]),
+            ("サッカー", "サッカー", vec![AccentType::Atamadaka]),
+            ("箸", "はし", vec![AccentType::Atamadaka]),
+            ("橋", "はし", vec![AccentType::Odaka]),
+            ("端", "はし", vec![AccentType::Heiban]),
+            ("鼻", "はな", vec![AccentType::Heiban]),
+            ("花", "はな", vec![AccentType::Odaka]),
+            (
+                "あの方",
+                "あのかた",
+                vec![AccentType::Nakadaka(3), AccentType::Odaka],
+            ),
         ];
         let trials = trials
             .iter()
@@ -545,6 +565,8 @@ mod test {
                 .unwrap(),
         );
 
-        assert_eq!(r2, "<span style=\"BORDER-BOTTOM: #FF6633 medium solid;\">か</span><span style=\"BORDER-LEFT: #FF6633 medium solid;BORDER-TOP: #FF6633 medium solid;\">ち</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">か</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">ち</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">…</span>");
+        print!("{}", r2);
+
+        assert_eq!(r2, "<span style=\"font-weight:bold\">形動: </span><span style=\"BORDER-BOTTOM: #FF6633 medium solid;\">か</span><span style=\"BORDER-LEFT: #FF6633 medium solid;BORDER-TOP: #FF6633 medium solid;\">ち</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">か</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">ち</span><span style=\"BORDER-TOP: #FF6633 medium solid;\">…</span>");
     }
 }
