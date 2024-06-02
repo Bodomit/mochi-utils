@@ -494,9 +494,6 @@ fn generate_mora_edges(kana_string: &KanaString, accent_type: &AccentType) -> Ve
 
 pub type AccentMap = HashMap<Word, Vec<WordAccents>>;
 
-// TODO Test notes are getting correctly loaded by load accents.
-// Use かちかち as a test case.
-
 #[cfg(test)]
 mod test {
     use super::*;
